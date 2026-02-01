@@ -1,0 +1,138 @@
+name: SWE-bench Training Loop
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_tasks:
+        description: 'Maximum tasks to process (0=all)'
+        required: false
+        default: '10'
+      dry_run:
+        description: 'Dry run mode (no LLM calls)'
+        required: false
+        default: 'false'
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hour max for training
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          pip install datasets
+      
+      - name: Download/restore bandit state
+        uses: actions/cache@v4
+        with:
+          path: .rfsn_upstream
+          key: swebench-learner-${{ github.sha }}
+          restore-keys: |
+            swebench-learner-
+      
+      - name: Extract tasks
+        run: |
+          python -m rfsn_upstream.swebench_extract_tasks \
+            --source princeton-nlp/SWE-bench_Lite \
+            --output tasks.jsonl \
+            --limit ${{ github.event.inputs.max_tasks || '10' }} \
+            --split test
+      
+      - name: Run training loop
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          
+          python -m rfsn_upstream.swebench_runner \
+            --tasks tasks.jsonl \
+            --output .rfsn_upstream \
+            --max-tasks ${{ github.event.inputs.max_tasks || '10' }} \
+            --provider auto \
+            $DRY_RUN_FLAG \
+            -v
+      
+      - name: Save training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-results-${{ github.run_number }}
+          path: |
+            .rfsn_upstream/ledger_*.jsonl
+            .rfsn_upstream/bandit.db
+            .rfsn_upstream/memory.db
+          retention-days: 30
+      
+      - name: Generate summary
+        run: |
+          echo "## SWE-bench Training Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f .rfsn_upstream/ledger_*.jsonl ]; then
+            TOTAL=$(wc -l < .rfsn_upstream/ledger_*.jsonl | tr -d ' ')
+            SUCCESS=$(grep -c '"success": true' .rfsn_upstream/ledger_*.jsonl || echo 0)
+            echo "- **Total tasks processed:** $TOTAL" >> $GITHUB_STEP_SUMMARY
+            echo "- **Successful:** $SUCCESS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No ledger file found." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  verify:
+    needs: train
+    runs-on: ubuntu-latest
+    if: github.event.inputs.dry_run != 'true'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      
+      - name: Download training artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: training-results-${{ github.run_number }}
+          path: .rfsn_upstream
+      
+      - name: Verify bandit convergence
+        run: |
+          python -c "
+          import sqlite3
+          from pathlib import Path
+          
+          db_path = Path('.rfsn_upstream/bandit.db')
+          if db_path.exists():
+              conn = sqlite3.connect(str(db_path))
+              cur = conn.cursor()
+              cur.execute('SELECT arm_id, successes, failures, last_updated FROM arms')
+              rows = cur.fetchall()
+              print('Arm Statistics:')
+              for row in rows:
+                  print(f'  {row[0]}: {row[1]} wins / {row[2]} losses')
+              conn.close()
+          else:
+              print('No bandit database found')
+          "
